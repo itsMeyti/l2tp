@@ -12,21 +12,35 @@ if ! grep -E 'Ubuntu|Debian' /etc/os-release > /dev/null; then
     exit 1
 fi
 
-# Update system
-apt-get update && apt-get upgrade -y || { echo "Failed to update system"; exit 1; }
+# Update system and fix repositories
+apt-get update || { echo "Failed to update package lists"; exit 1; }
+apt-get upgrade -y || { echo "Failed to upgrade system"; exit 1; }
+
+# Add MariaDB repository if MySQL is unavailable
+if ! apt-cache show mysql-server >/dev/null 2>&1; then
+    echo "MySQL not found, adding MariaDB repository..."
+    apt-get install -y software-properties-common
+    apt-key adv --fetch-keys 'https://mariadb.org/mariadb_release_signing_key.asc' || { echo "Failed to fetch MariaDB key"; exit 1; }
+    add-apt-repository 'deb [arch=amd64] https://mirror.rackspace.com/mariadb/repo/10.6/ubuntu focal main' || { echo "Failed to add MariaDB repository"; exit 1; }
+    apt-get update || { echo "Failed to update after adding MariaDB repository"; exit 1; }
+fi
 
 # Install required dependencies with error checking
-apt-get install -y strongswan xl2tpd iptables php php-fpm php-mysql php-mbstring php-xml php-zip composer nginx mysql-server || { echo "Failed to install dependencies"; exit 1; }
+apt-get install -y strongswan xl2tpd iptables php php-fpm php-mysql php-mbstring php-xml php-zip composer nginx mariadb-server || { echo "Failed to install dependencies"; exit 1; }
 
-# Ensure PHP and MySQL commands are available
+# Ensure PHP and MariaDB commands are available
 if ! command -v php >/dev/null 2>&1; then
     echo "PHP not found, reinstalling..."
     apt-get install -y php php-fpm
 fi
 if ! command -v mysql >/dev/null 2>&1; then
-    echo "MySQL not found, reinstalling..."
-    apt-get install -y mysql-server
+    echo "MariaDB not found, reinstalling..."
+    apt-get install -y mariadb-server
 fi
+
+# Start and enable MariaDB
+systemctl enable mariadb || echo "Warning: Failed to enable mariadb"
+systemctl start mariadb || echo "Warning: Failed to start mariadb"
 
 # Install L2TP/IPsec
 echo "Configuring L2TP/IPsec..."
@@ -100,8 +114,8 @@ apt-get install -y iptables-persistent || echo "Warning: iptables-persistent not
 service netfilter-persistent start || echo "Warning: netfilter-persistent failed to start"
 
 # Start and enable services with error checking
-systemctl enable ipsec || echo "Warning: Failed to enable strongswan"
-systemctl restart ipsec || echo "Warning: Failed to restart strongswan"
+systemctl enable ipsec || echo "Warning: Failed to enable ipsec"
+systemctl restart ipsec || echo "Warning: Failed to restart ipsec"
 systemctl enable xl2tpd || echo "Warning: Failed to enable xl2tpd"
 systemctl restart xl2tpd || echo "Warning: Failed to restart xl2tpd"
 
@@ -115,9 +129,9 @@ chmod -R 775 /var/www/vpn_panel/bootstrap/cache
 cd /var/www/vpn_panel
 composer create-project --prefer-dist laravel/laravel . || { echo "Failed to install Laravel"; exit 1; }
 
-# Setup MySQL
+# Setup MariaDB
 mysql -u root -e "CREATE DATABASE IF NOT EXISTS vpn_panel;" || { echo "Failed to create database"; exit 1; }
-mysql -u root -e "CREATE USER IF NOT EXISTS 'vpn_admin'@'localhost' IDENTIFIED BY 'secure_password';" || { echo "Failed to create MySQL user"; exit 1; }
+mysql -u root -e "CREATE USER IF NOT EXISTS 'vpn_admin'@'localhost' IDENTIFIED BY 'secure_password';" || { echo "Failed to create MariaDB user"; exit 1; }
 mysql -u root -e "GRANT ALL PRIVILEGES ON vpn_panel.* TO 'vpn_admin'@'localhost';" || { echo "Failed to grant privileges"; exit 1; }
 mysql -u root -e "FLUSH PRIVILEGES;" || { echo "Failed to flush privileges"; exit 1; }
 
