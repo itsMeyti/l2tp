@@ -7,19 +7,26 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 # Check OS (Ubuntu/Debian)
-if ! grep -E 'Tweaked for Ubuntu|Debian' /etc/os-release > /dev/null; then
+if ! grep -E 'Ubuntu|Debian' /etc/os-release > /dev/null; then
     echo "This script only supports Ubuntu or Debian"
     exit 1
 fi
 
 # Update system
-apt-get update && apt-get upgrade -y
+apt-get update && apt-get upgrade -y || { echo "Failed to update system"; exit 1; }
 
-# Install L2TP/IPsec dependencies
-apt-get install -y strongswan xl2tpd iptables
+# Install required dependencies with error checking
+apt-get install -y strongswan xl2tpd iptables php php-fpm php-mysql php-mbstring php-xml php-zip composer nginx mysql-server || { echo "Failed to install dependencies"; exit 1; }
 
-# Install PHP, Composer, Nginx, and Laravel dependencies
-apt-get install -y php php-fpm php-mysql php-mbstring php-xml php-zip composer nginx mysql-server
+# Ensure PHP and MySQL commands are available
+if ! command -v php >/dev/null 2>&1; then
+    echo "PHP not found, reinstalling..."
+    apt-get install -y php php-fpm
+fi
+if ! command -v mysql >/dev/null 2>&1; then
+    echo "MySQL not found, reinstalling..."
+    apt-get install -y mysql-server
+fi
 
 # Install L2TP/IPsec
 echo "Configuring L2TP/IPsec..."
@@ -85,29 +92,34 @@ $vpn_user l2tpd $vpn_pass *
 EOF
 
 # Configure firewall
-iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE || echo "Warning: iptables NAT setup failed"
 iptables -A FORWARD -p udp --dport 1701 -j ACCEPT
 iptables -A FORWARD -p udp --dport 500 -j ACCEPT
 iptables -A FORWARD -p udp --dport 4500 -j ACCEPT
-apt-get install -y iptables-persistent
-service netfilter-persistent start
+apt-get install -y iptables-persistent || echo "Warning: iptables-persistent not installed"
+service netfilter-persistent start || echo "Warning: netfilter-persistent failed to start"
 
-# Start services
-systemctl enable strongswan xl2tpd
-systemctl restart strongswan xl2tpd
+# Start and enable services with error checking
+systemctl enable ipsec || echo "Warning: Failed to enable strongswan"
+systemctl restart ipsec || echo "Warning: Failed to restart strongswan"
+systemctl enable xl2tpd || echo "Warning: Failed to enable xl2tpd"
+systemctl restart xl2tpd || echo "Warning: Failed to restart xl2tpd"
 
-# Install Laravel
-cd /var/www
-composer create-project --prefer-dist laravel/laravel vpn_panel
+# Create Laravel directory if it doesn't exist
+mkdir -p /var/www/vpn_panel
 chown -R www-data:www-data /var/www/vpn_panel
 chmod -R 775 /var/www/vpn_panel/storage
 chmod -R 775 /var/www/vpn_panel/bootstrap/cache
 
+# Install Laravel
+cd /var/www/vpn_panel
+composer create-project --prefer-dist laravel/laravel . || { echo "Failed to install Laravel"; exit 1; }
+
 # Setup MySQL
-mysql -e "CREATE DATABASE vpn_panel;"
-mysql -e "CREATE USER 'vpn_admin'@'localhost' IDENTIFIED BY 'secure_password';"
-mysql -e "GRANT ALL PRIVILEGES ON vpn_panel.* TO 'vpn_admin'@'localhost';"
-mysql -e "FLUSH PRIVILEGES;"
+mysql -u root -e "CREATE DATABASE IF NOT EXISTS vpn_panel;" || { echo "Failed to create database"; exit 1; }
+mysql -u root -e "CREATE USER IF NOT EXISTS 'vpn_admin'@'localhost' IDENTIFIED BY 'secure_password';" || { echo "Failed to create MySQL user"; exit 1; }
+mysql -u root -e "GRANT ALL PRIVILEGES ON vpn_panel.* TO 'vpn_admin'@'localhost';" || { echo "Failed to grant privileges"; exit 1; }
+mysql -u root -e "FLUSH PRIVILEGES;" || { echo "Failed to flush privileges"; exit 1; }
 
 # Configure Laravel .env
 cat > /var/www/vpn_panel/.env <<EOF
@@ -126,8 +138,7 @@ DB_PASSWORD=secure_password
 EOF
 
 # Generate Laravel key
-cd /var/www/vpn_panel
-php artisan key:generate
+php artisan key:generate || { echo "Failed to generate Laravel key"; exit 1; }
 
 # Create Laravel project files
 mkdir -p /var/www/vpn_panel/database/migrations
@@ -587,12 +598,12 @@ server {
 }
 EOF
 
-ln -s /etc/nginx/sites-available/vpn_panel /etc/nginx/sites-enabled/
-systemctl restart nginx
+ln -sf /etc/nginx/sites-available/vpn_panel /etc/nginx/sites-enabled/
+systemctl restart nginx || { echo "Warning: Failed to restart nginx"; exit 1; }
 
 # Run migrations
 cd /var/www/vpn_panel
-php artisan migrate
+php artisan migrate || { echo "Failed to run migrations"; exit 1; }
 
 # Set permissions for chap-secrets
 chmod 600 /etc/ppp/chap-secrets
