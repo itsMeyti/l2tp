@@ -29,7 +29,7 @@ fi
 apt-get install -y strongswan xl2tpd iptables php php-fpm php-mysql php-mbstring php-xml php-zip composer nginx mariadb-server || { echo "Failed to install dependencies"; exit 1; }
 
 # Ensure PHP and MariaDB commands are available
-if ! command -v php >/dev/null 2>&1; then
+if nicely command -v php >/dev/null 2>&1; then
     echo "PHP not found, reinstalling..."
     apt-get install -y php php-fpm
 fi
@@ -158,6 +158,7 @@ php artisan key:generate || { echo "Failed to generate Laravel key"; exit 1; }
 mkdir -p /var/www/vpn_panel/database/migrations
 mkdir -p /var/www/vpn_panel/app/Models
 mkdir -p /var/www/vpn_panel/app/Http/Controllers
+mkdir -p /var/www/vpn_panel/app/Console/Commands
 mkdir -p /var/www/vpn_panel/resources/views/layouts
 
 # Migration: vpn_users
@@ -239,7 +240,7 @@ class VpnUser extends Model
         \$lines = [];
         \$users = self::all();
         foreach (\$users as \$user) {
-            \$lines[] = "\{\$user->username} l2tpd {\$user->password} *";
+            \$lines[] = "\$user->username l2tpd \$user->password *";
         }
         file_put_contents('/etc/ppp/chap-secrets', implode("\n", \$lines) . "\n");
         shell_exec('systemctl restart xl2tpd');
@@ -266,6 +267,143 @@ class Admin extends Model
 }
 EOF
 
+# CLI Command: VpnManage
+cat > /var/www/vpn_panel/app/Console/Commands/VpnManage.php <<EOF
+<?php
+namespace App\Console\Commands;
+
+use Illuminate\Console\Command;
+use App\Models\VpnUser;
+use Illuminate\Support\Facades\Hash;
+
+class VpnManage extends Command
+{
+    protected \$signature = 'vpn:manage {action : Action to perform (add|edit|delete|list|status)} {username?}';
+    protected \$description = 'Manage VPN users and services via CLI';
+
+    public function handle()
+    {
+        \$action = \$this->argument('action');
+        \$username = \$this->argument('username');
+
+        switch (\$action) {
+            case 'add':
+                \$this->addUser();
+                break;
+            case 'edit':
+                if (!\$username) {
+                    \$this->error('Username is required for edit action');
+                    return 1;
+                }
+                \$this->editUser(\$username);
+                break;
+            case 'delete':
+                if (!\$username) {
+                    \$this->error('Username is required for delete action');
+                    return 1;
+                }
+                \$this->deleteUser(\$username);
+                break;
+            case 'list':
+                \$this->listUsers();
+                break;
+            case 'status':
+                \$this->checkStatus();
+                break;
+            default:
+                \$this->error('Invalid action. Use: add, edit, delete, list, or status');
+                return 1;
+        }
+        return 0;
+    }
+
+    private function addUser()
+    {
+        \$username = \$this->ask('Enter username');
+        if (VpnUser::where('username', \$username)->exists()) {
+            \$this->error('Username already exists');
+            return;
+        }
+        \$password = \$this->secret('Enter password');
+        \$expires_at = \$this->ask('Enter expiration date (YYYY-MM-DD, optional)', null);
+        \$connection_limit = \$this->ask('Enter connection limit (0 for unlimited, optional)', 0);
+
+        \$user = VpnUser::create([
+            'username' => \$username,
+            'password' => \$password,
+            'expires_at' => \$expires_at,
+            'connection_limit' => \$connection_limit,
+        ]);
+        \$user->syncToChapSecrets();
+        \$this->info("User \$username added successfully");
+    }
+
+    private function editUser(\$username)
+    {
+        \$user = VpnUser::where('username', \$username)->first();
+        if (!\$user) {
+            \$this->error('User not found');
+            return;
+        }
+        \$password = \$this->secret('Enter new password (press enter to keep current)');
+        \$expires_at = \$this->ask('Enter new expiration date (YYYY-MM-DD, optional)', \$user->expires_at);
+        \$connection_limit = \$this->ask('Enter new connection limit (0 for unlimited, optional)', \$user->connection_limit);
+
+        \$updates = [];
+        if (\$password) \$updates['password'] = \$password;
+        if (\$expires_at) \$updates['expires_at'] = \$expires_at;
+        \$updates['connection_limit'] = \$connection_limit;
+
+        \$user->update(\$updates);
+        \$user->syncToChapSecrets();
+        \$this->info("User \$username updated successfully");
+    }
+
+    private function deleteUser(\$username)
+    {
+        \$user = VpnUser::where('username', \$username)->first();
+        if (!\$user) {
+            \$this->error('User not found');
+            return;
+        }
+        \$user->delete();
+        \$user->syncToChapSecrets();
+        \$this->info("User \$username deleted successfully");
+    }
+
+    private function listUsers()
+    {
+        \$users = VpnUser::all();
+        if (\$users->isEmpty()) {
+            \$this->info('No users found');
+            return;
+        }
+        \$this->table(
+            ['Username', 'Created At', 'Expires At', 'Connections', 'Limit'],
+            \$users->map(function (\$user) {
+                return [
+                    \$user->username,
+                    \$user->created_at,
+                    \$user->expires_at ?? 'None',
+                    \$user->connections_used,
+                    \$user->connection_limit
+                ];
+            })
+        );
+    }
+
+    private function checkStatus()
+    {
+        \$strongswanStatus = trim(shell_exec('systemctl is-active strongswan'));
+        \$xl2tpdStatus = trim(shell_exec('systemctl is-active xl2tpd'));
+        \$this->info("StrongSwan Status: \$strongswanStatus");
+        \$this->info("XL2TPD Status: \$xl2tpdStatus");
+        \$activeConnections = trim(shell_exec('ipsec status | grep -c ESTABLISHED') ?: '0');
+        \$this->info("Active Connections: \$activeConnections");
+    }
+}
+EOF
+
 # Controller: VpnController
 cat > /var/www/vpn_panel/app/Http/Controllers/VpnController.php <<EOF
 <?php
@@ -286,9 +424,9 @@ class VpnController extends Controller
     public function dashboard()
     {
         \$userCount = VpnUser::count();
-        \$activeUsers = 0; // Implement actual logic using ipsec status
-        \$strongswanStatus = shell_exec('systemctl is-active strongswan');
-        \$xl2tpdStatus = shell_exec('systemctl is-active xl2tpd');
+        \$activeUsers = (int) trim(shell_exec('ipsec status | grep -c ESTABLISHED') ?: '0');
+        \$strongswanStatus = trim(shell_exec('systemctl is-active strongswan'));
+        \$xl2tpdStatus = trim(shell_exec('systemctl is-active xl2tpd'));
 
         return view('dashboard', compact('userCount', 'activeUsers', 'strongswanStatus', 'xl2tpdStatus'));
     }
@@ -388,7 +526,11 @@ cat > /var/www/vpn_panel/resources/views/layouts/app.blade.php <<EOF
         @if (Auth::guard('admin')->check())
         <nav class="bg-blue-600 text-white p-4 rounded mb-4 flex justify-between">
             <h1 class="text-2xl font-bold">VPN Admin Panel</h1>
-            <a href="{{ route('logout') }}" class="text-white hover:underline">Logout</a>
+            <div>
+                <a href="{{ route('users') }}" class="text-white hover:underline mr-4">Users</a>
+                <a href="{{ route('logs') }}" class="text-white hover:underline mr-4">Logs</a>
+                <a href="{{ route('logout') }}" class="text-white hover:underline">Logout</a>
+            </div>
         </nav>
         @endif
         @yield('content')
@@ -418,8 +560,7 @@ cat > /var/www/vpn_panel/resources/views/dashboard.blade.php <<EOF
     </div>
 </div>
 <div class="mt-4">
-    <a href="{{ route('users') }}" class="bg-blue-600 text-white px-4 py-2 rounded hover:bg-blue-700">Manage Users</a>
-    <a href="{{ route('logs') }}" class="bg-gray-600 text-white px-4 py-2 rounded hover:bg-gray-700">View Logs</a>
+    <p class="text-gray-600">CLI Management: Run <code>php artisan vpn:manage --help</code> for CLI commands</p>
 </div>
 @endsection
 EOF
@@ -464,6 +605,8 @@ cat > /var/www/vpn_panel/resources/views/users.blade.php <<EOF
                         @csrf
                         @method('PATCH')
                         <input type="password" name="password" placeholder="New Password" class="border p-1 rounded">
+                        <input type="date" name="expires_at" placeholder="Expiration Date" class="border p-1 rounded" value="{{ \$user->expires_at }}">
+                        <input type="number" name="connection_limit" placeholder="Connection Limit" class="border p-1 rounded" value="{{ \$user->connection_limit }}">
                         <button type="submit" class="bg-yellow-600 text-white px-2 py-1 rounded hover:bg-yellow-700">Edit</button>
                     </form>
                     <form action="{{ route('deleteUser', \$user) }}" method="POST" class="inline">
@@ -508,6 +651,7 @@ cat > /var/www/vpn_panel/resources/views/login.blade.php <<EOF
             </div>
             <button type="submit" class="w-full bg-blue-600 text-white p-2 rounded hover:bg-blue-700">Login</button>
         </form>
+        <p class="mt-4 text-center text-gray-600">CLI Management: Run <code>php artisan vpn:manage --help</code></p>
     </div>
 </body>
 </html>
@@ -615,8 +759,46 @@ EOF
 ln -sf /etc/nginx/sites-available/vpn_panel /etc/nginx/sites-enabled/
 systemctl restart nginx || { echo "Warning: Failed to restart nginx"; exit 1; }
 
-# Run migrations
+# Register CLI command
+cat > /var/www/vpn_panel/app/Console/Kernel.php <<EOF
+<?php
+namespace App\Console;
+
+use Illuminate\Console\Scheduling\Schedule;
+use Illuminate\Foundation\Console\Kernel as ConsoleKernel;
+
+class Kernel extends ConsoleKernel
+{
+    protected \$commands = [
+        \App\Console\Commands\VpnManage::class,
+    ];
+
+    protected function schedule(Schedule \$schedule)
+    {
+        // \$schedule->command('inspire')->hourly();
+    }
+
+    protected function commands()
+    {
+        \$this->load(__DIR__.'/Commands');
+
+        require base_path('routes/console.php');
+    }
+}
+EOF
+
+# Create CLI executable
+cat > /usr/local/bin/vpn-manage <<EOF
+#!/bin/bash
 cd /var/www/vpn_panel
+php artisan vpn:manage "\$@"
+EOF
+chmod +x /usr/local/bin/vpn-manage
+
+# Run migrations
+cd
+
+ /var/www/vpn_panel
 php artisan migrate || { echo "Failed to run migrations"; exit 1; }
 
 # Set permissions for chap-secrets
@@ -625,3 +807,5 @@ chown www-data:www-data /etc/ppp/chap-secrets
 
 echo "Installation complete! Access the panel at http://your_server_ip"
 echo "Default admin login: admin / admin123"
+echo "CLI Usage: vpn-manage {add|edit|delete|list|status} [username]"
+echo "Run 'vpn-manage --help' for more information"
